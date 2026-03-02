@@ -37,6 +37,12 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Symmetric tanh logit softcap start value. Set <= 0 to disable softcapping.
+    logit_softcap: float = 15.0
+    # Cross-entropy label smoothing factor in [0, 1).
+    label_smoothing: float = 0.0
+    # Coefficient for z-loss term: E[(logsumexp(logits))^2].
+    z_loss_coeff: float = 0.0
 
 
 def norm(x):
@@ -184,6 +190,12 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
+        # Runtime-updatable scalar used in forward to support scheduled softcap.
+        self.register_buffer(
+            "logit_softcap_runtime",
+            torch.tensor(float(config.logit_softcap), dtype=torch.float32),
+            persistent=False,
+        )
 
     @torch.no_grad()
     def init_weights(self):
@@ -233,6 +245,7 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
+        self.logit_softcap_runtime.fill_(float(self.config.logit_softcap))
 
         # Cast embeddings to bf16: optimizer can tolerate it and it saves memory
         if self.transformer.wte.weight.device.type == "cuda":
@@ -288,6 +301,10 @@ class GPT(nn.Module):
 
     def get_device(self):
         return self.transformer.wte.weight.device
+
+    @torch.no_grad()
+    def set_logit_softcap(self, value: float):
+        self.logit_softcap_runtime.fill_(float(value))
 
     def estimate_flops(self):
         """
@@ -345,7 +362,16 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+    def setup_optimizer(
+        self,
+        unembedding_lr=0.004,
+        embedding_lr=0.2,
+        matrix_lr=0.02,
+        weight_decay=0.0,
+        adam_betas=(0.8, 0.95),
+        scalar_lr=0.5,
+        head_weight_decay=0.0,
+    ):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
@@ -365,7 +391,7 @@ class GPT(nn.Module):
         # Build param_groups with all required fields explicit
         param_groups = [
             # AdamW groups (embeddings, lm_head, scalars)
-            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=head_weight_decay),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
@@ -407,16 +433,42 @@ class GPT(nn.Module):
         x = norm(x)
 
         # Forward the lm_head (compute logits)
-        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
         logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap) # squash the logits
+        softcap = self.logit_softcap_runtime.to(device=logits.device, dtype=logits.dtype)
+        softcap_pos = torch.clamp_min(softcap, 0.0)
+        inv_softcap = torch.where(softcap_pos > 0.0, 1.0 / softcap_pos, torch.zeros_like(softcap_pos))
+        logits_capped = softcap_pos * torch.tanh(logits * inv_softcap)
+        logits = torch.where(softcap_pos > 0.0, logits_capped, logits)
 
         if targets is not None:
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            logits_flat = logits.view(-1, logits.size(-1))
+            targets_flat = targets.view(-1)
+            label_smoothing = float(self.config.label_smoothing)
+            loss = F.cross_entropy(
+                logits_flat,
+                targets_flat,
+                ignore_index=-1,
+                reduction=loss_reduction,
+                label_smoothing=label_smoothing,
+            )
+            z_loss_coeff = float(self.config.z_loss_coeff)
+            if z_loss_coeff > 0.0:
+                valid = targets_flat != -1
+                z_term = z_loss_coeff * torch.logsumexp(logits_flat, dim=-1).square()
+                z_term = torch.where(valid, z_term, torch.zeros_like(z_term))
+                if loss_reduction == "none":
+                    loss = loss + z_term
+                elif loss_reduction == "sum":
+                    loss = loss + z_term.sum()
+                elif loss_reduction == "mean":
+                    denom = torch.clamp_min(valid.sum(), 1).to(dtype=logits_flat.dtype)
+                    loss = loss + z_term.sum() / denom
+                else:
+                    raise ValueError(f"Unsupported loss_reduction: {loss_reduction}")
             return loss
         else:
             # inference: just return the logits directly

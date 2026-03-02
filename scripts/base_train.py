@@ -42,6 +42,7 @@ parser = argparse.ArgumentParser(description="Pretrain base model")
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument("--seed", type=int, default=42, help="global random seed")
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
@@ -51,6 +52,27 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--logit-softcap", type=float, default=15.0, help="symmetric tanh logit softcap start value (<=0 disables softcap)")
+parser.add_argument("--logit-softcap-final", type=float, default=None, help="final softcap value for scheduled runs (default: same as --logit-softcap)")
+parser.add_argument(
+    "--logit-softcap-schedule",
+    type=str,
+    default="constant",
+    choices=["constant", "linear", "cosine"],
+    help="runtime schedule for logit softcap",
+)
+parser.add_argument(
+    "--logit-softcap-decay-start-ratio",
+    type=float,
+    default=0.5,
+    help="fraction of total steps where softcap decay starts (for linear/cosine)",
+)
+parser.add_argument(
+    "--logit-softcap-decay-end-ratio",
+    type=float,
+    default=1.0,
+    help="fraction of total steps where softcap decay ends (for linear/cosine)",
+)
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -60,11 +82,14 @@ parser.add_argument("--device-batch-size", type=int, default=32, help="per-devic
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
+parser.add_argument("--head-weight-decay", type=float, default=0.0, help="weight decay on lm_head AdamW group")
 parser.add_argument("--weight-decay", type=float, default=0.2, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 for embedding/unembedding")
 parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
+parser.add_argument("--label-smoothing", type=float, default=0.0, help="label smoothing factor for cross-entropy")
+parser.add_argument("--z-loss-coeff", type=float, default=0.0, help="coefficient for z-loss term E[(logsumexp(logits))^2]")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
@@ -80,11 +105,13 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
+assert 0.0 <= args.label_smoothing < 1.0, "--label-smoothing must be in [0, 1)"
+assert args.z_loss_coeff >= 0.0, "--z-loss-coeff must be >= 0"
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
-ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type, seed=args.seed)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
@@ -133,6 +160,9 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        logit_softcap=args.logit_softcap,
+        label_smoothing=args.label_smoothing,
+        z_loss_coeff=args.z_loss_coeff,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -305,6 +335,7 @@ optimizer = model.setup_optimizer(
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
     scalar_lr=args.scalar_lr * batch_lr_scale,
+    head_weight_decay=args.head_weight_decay,
     adam_betas=(args.adam_beta1, args.adam_beta2),
     # Muon hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
@@ -368,6 +399,37 @@ def get_muon_momentum(it):
 def get_weight_decay(it):
     return weight_decay_scaled * (1 - it / num_iterations)
 
+# Runtime logit-softcap scheduler. This updates a scalar tensor on the model each step.
+logit_softcap_start = float(args.logit_softcap)
+logit_softcap_final = logit_softcap_start if args.logit_softcap_final is None else float(args.logit_softcap_final)
+if args.logit_softcap_schedule != "constant":
+    assert 0.0 <= args.logit_softcap_decay_start_ratio < args.logit_softcap_decay_end_ratio <= 1.0, (
+        "logit softcap decay ratios must satisfy 0 <= start < end <= 1"
+    )
+logit_softcap_decay_start_it = round(args.logit_softcap_decay_start_ratio * num_iterations)
+logit_softcap_decay_end_it = round(args.logit_softcap_decay_end_ratio * num_iterations)
+if logit_softcap_decay_end_it <= logit_softcap_decay_start_it:
+    logit_softcap_decay_end_it = logit_softcap_decay_start_it + 1
+print0(
+    "Logit softcap schedule: "
+    f"{args.logit_softcap_schedule} "
+    f"start={logit_softcap_start:.4f} final={logit_softcap_final:.4f} "
+    f"decay_steps=[{logit_softcap_decay_start_it}, {logit_softcap_decay_end_it}]"
+)
+
+def get_logit_softcap(it):
+    if args.logit_softcap_schedule == "constant":
+        return logit_softcap_start
+    if it <= logit_softcap_decay_start_it:
+        return logit_softcap_start
+    if it >= logit_softcap_decay_end_it:
+        return logit_softcap_final
+    progress = (it - logit_softcap_decay_start_it) / (logit_softcap_decay_end_it - logit_softcap_decay_start_it)
+    if args.logit_softcap_schedule == "linear":
+        return logit_softcap_start + (logit_softcap_final - logit_softcap_start) * progress
+    cos_w = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return logit_softcap_final + (logit_softcap_start - logit_softcap_final) * cos_w
+
 # -----------------------------------------------------------------------------
 # Training loop
 
@@ -399,6 +461,8 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
+    current_logit_softcap = get_logit_softcap(step)
+    orig_model.set_logit_softcap(current_logit_softcap)
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
@@ -534,7 +598,7 @@ while True:
     else:
         eta_str = ""
     epoch = dataloader_state_dict["epoch"]
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | lsc: {current_logit_softcap:.4f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -546,6 +610,7 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
+            "train/logit_softcap": current_logit_softcap,
         }
         wandb_run.log(log_data)
 
